@@ -16,6 +16,16 @@ Key rules baked in here (all verified against the workbook):
   * Scenario filter is applied to route_options ONLY (route network layer).
   * Hubs are joined on hub_id ONLY - the two DisruptionScenario columns
     describe different things and must never be matched to each other.
+  * Hub-side disruption (Hub_Constraints.DisruptionScenario +
+    CapacityReductionPct) is a SEPARATE axis controlled by the
+    `hub_disruption` argument of load_sheets():
+        None (default)      -> clean network, no capacity cuts (true baseline)
+        "Port congestion"   -> cut only hubs tagged Port congestion (guide S1)
+        "Labor shortage"    -> cut only hubs tagged Labor shortage
+        "Weather disruption"-> cut only hubs tagged Weather disruption
+        "all"               -> cut every tagged hub at once (legacy behaviour
+                               of runs before 18 Jul 2026, kept for
+                               reproducibility of earlier outputs)
   * Handling capability uses the dedicated boolean columns, not text search.
   * Capability assumption: BOTH origin and destination hubs must satisfy the
     requirement.  (Swap ASSUME_BOTH_HUBS to False to test destination-only.)
@@ -55,7 +65,27 @@ def _yes(v) -> bool:
 # --------------------------------------------------------------------------
 # Load + light clean
 # --------------------------------------------------------------------------
-def load_sheets(workbook: Path = WORKBOOK) -> dict[str, pd.DataFrame]:
+HUB_DISRUPTION_LEGACY_ALL = "all"   # pre-18-Jul behaviour: cut every tagged hub
+
+
+def load_sheets(workbook: Path = WORKBOOK,
+                hub_disruption: str | None = None) -> dict[str, pd.DataFrame]:
+    """Load the five sheets and pre-compute hub capacity.
+
+    hub_disruption selects the HUB-SIDE disruption axis (guide Scenario 1):
+      None                  -> no CapacityReductionPct applied anywhere.
+      "Port congestion" /
+      "Labor shortage" /
+      "Weather disruption"  -> apply each hub's CapacityReductionPct only
+                               where Hub_Constraints.DisruptionScenario
+                               matches that value.
+      "all"                 -> legacy: apply the cut to every tagged hub
+                               (what all runs before 18 Jul 2026 did).
+
+    This is independent of the ROUTE-side scenario (Normal / PrimaryHubDown /
+    AirCapacityReduced) passed to build_candidates() - the two DisruptionScenario
+    columns are different axes and are never joined to each other.
+    """
     xl = pd.ExcelFile(workbook)
     I = xl.parse("Internal_Shipments")
     M = xl.parse("Material_Families")
@@ -73,17 +103,35 @@ def load_sheets(workbook: Path = WORKBOOK) -> dict[str, pd.DataFrame]:
     })
     H["capacity_reduction_ratio"] = H["capacity_reduction_ratio"].fillna(0.0)
 
-    # 3) Pre-compute each hub's remaining weekly capacity ONCE.
-    #    ceiling = weekly * (max_util * (1 - reduction))  [reduction baked per hub]
+    # 3) Decide which hubs actually take their capacity cut this run.
+    if hub_disruption is None:
+        applied = pd.Series(0.0, index=H.index)
+    elif hub_disruption == HUB_DISRUPTION_LEGACY_ALL:
+        applied = H["capacity_reduction_ratio"]
+    else:
+        valid = set(H["DisruptionScenario"].dropna().unique()) - {"None"}
+        if hub_disruption not in valid:
+            raise ValueError(
+                f"hub_disruption={hub_disruption!r} not in Hub_Constraints."
+                f"DisruptionScenario; valid values: {sorted(valid)} or "
+                f"'{HUB_DISRUPTION_LEGACY_ALL}' or None")
+        applied = H["capacity_reduction_ratio"].where(
+            H["DisruptionScenario"] == hub_disruption, 0.0)
+    H["applied_reduction_ratio"] = applied
+
+    # 4) Pre-compute each hub's remaining weekly capacity ONCE.
+    #    ceiling = weekly * (max_util * (1 - applied_reduction))
     #    remaining = max(0, ceiling - current_load)
     ceiling = (
         H["WeeklyCapacityUnits"]
-        * (H["max_utilization_ratio"] * (1.0 - H["capacity_reduction_ratio"]))
+        * (H["max_utilization_ratio"] * (1.0 - H["applied_reduction_ratio"]))
     )
     current_load = H["WeeklyCapacityUnits"] * H["current_utilization_ratio"]
     H["remaining_capacity_units"] = (ceiling - current_load).clip(lower=0)
 
-    return {"internal": I, "material": M, "route": R, "hub": H}
+    sheets = {"internal": I, "material": M, "route": R, "hub": H}
+    sheets["hub_disruption"] = hub_disruption   # metadata for reporting
+    return sheets
 
 
 # --------------------------------------------------------------------------
@@ -126,24 +174,42 @@ def build_candidates(sheets: dict[str, pd.DataFrame],
     return cand
 
 
-def _route_ok(row) -> bool:
-    """Handling compatibility for a single candidate row."""
-    hubs = ["orig_", "dest_"] if ASSUME_BOTH_HUBS else ["dest_"]
+def _route_ok(row, require_cold_chain: bool = True, require_hazard: bool = True,
+              require_both_hubs: bool = True) -> bool:
+    """Handling compatibility for a single candidate row.
+
+    The three switches let a scenario isolate ONE capability rule without
+    disabling the others (guide Scenario 2 counterfactual): turning off
+    require_cold_chain must NOT let hazardous materials through hubs that
+    lack ESD / moisture / lithium handling, so require_hazard stays True.
+    """
+    hubs = ["orig_", "dest_"] if require_both_hubs else ["dest_"]
 
     cold_needed = str(row["TempRequirement"]).strip().lower() in COLD_VALUES
     hz = str(row["HazardClass"]).strip()
     hz_flag = HAZARD_TO_HUBFLAG.get(hz)  # None for "None"
 
     for p in hubs:
-        if cold_needed and not _yes(row[f"{p}ColdChainAvailable"]):
+        if require_cold_chain and cold_needed and not _yes(row[f"{p}ColdChainAvailable"]):
             return False
-        if hz_flag and not _yes(row[f"{p}{hz_flag}"]):
+        if require_hazard and hz_flag and not _yes(row[f"{p}{hz_flag}"]):
             return False
     return True
 
 
-def apply_capability(cand: pd.DataFrame) -> pd.DataFrame:
-    return cand[cand.apply(_route_ok, axis=1)].copy()
+def apply_capability(cand: pd.DataFrame, require_cold_chain: bool = True,
+                     require_hazard: bool = True,
+                     require_both_hubs: bool | None = None) -> pd.DataFrame:
+    """Filter candidates to handling-compatible routes.
+
+    Defaults reproduce the original behaviour exactly (all rules on, both
+    hubs must qualify per ASSUME_BOTH_HUBS).
+    """
+    if require_both_hubs is None:
+        require_both_hubs = ASSUME_BOTH_HUBS
+    return cand[cand.apply(
+        lambda r: _route_ok(r, require_cold_chain, require_hazard, require_both_hubs),
+        axis=1)].copy()
 
 
 def feasibility_summary(feas: pd.DataFrame, all_ids) -> dict:

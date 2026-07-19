@@ -377,6 +377,13 @@ def solve_official_delivery(scenario, sheets, scaler, horizon_weeks, dbs,
 
 
 ASSUMPTIONS_OFFICIAL = [
+    ("STATUS: route extension, non-official for external",
+     "Per Infineon instructor clarification, the OFFICIAL external MinScore is a direct 40/40/20 "
+     "calculation on the supplied External Shipments.{BestLeadTimeDays, LowestCostPerKG_EUR, "
+     "LowestRiskScore} columns (see optimizer_external_official_scores.xlsx). This combined "
+     "delivery-grain model derives the external cost/kg from route_options and is therefore a "
+     "ROUTE EXTENSION - its per-delivery score is a ScenarioRouteScore, not the official ExternalMinScore. "
+     "The internal route optimiser remains valid; only the external scoring basis is superseded."),
     ("Objective (graded MinScore)",
      "Normalised 40/40/20 MinScore per DELIVERY: 0.4*norm(BaseLeadTimeDays) + 0.4*norm(CostPerKG) "
      "+ 0.2*norm(RiskScore). Lower is better. Min-max normalisation is a stated modelling assumption "
@@ -391,9 +398,11 @@ ASSUMPTIONS_OFFICIAL = [
      "in the separate proxy (cost/piece) model. Averages are over scored deliveries; unassigned "
      "deliveries are listed in Unassigned, never silently dropped."),
     ("Scenario layers",
-     "Route scenario (Normal/PrimaryHubDown/AirCapacityReduced) filters Route_Options only. Hub "
-     "disruption is a per-hub attribute in Hub_Constraints; the two DisruptionScenario columns are "
-     "never matched to each other."),
+     "Two independent axes. (1) Route scenario (Normal/PrimaryHubDown/AirCapacityReduced) filters "
+     "Route_Options only. (2) Hub disruption is a per-hub capacity cut in Hub_Constraints, activated "
+     "via --hub-disruption and applied only to matching hubs (or every tagged hub in legacy 'all' "
+     "mode). The two DisruptionScenario columns are never matched to each other. The exact axes used "
+     "for THIS workbook are stated in the 'Active run configuration' rows below and in Summary."),
     ("Handling capability",
      "Cold chain + hazard class via dedicated hub booleans; BOTH origin and destination hubs must "
      "qualify (stated assumption)."),
@@ -426,7 +435,25 @@ TRADEOFF_OFFICIAL = (
 )
 
 
-def _export_official(out_path, scaler, per_scenario, unassigned_rows, route_frames):
+def _run_config_rows(hub_disruption, scenarios):
+    """Explicit per-run context so a reader never has to infer the mode from the filename."""
+    if hub_disruption is None:
+        hub_txt = "None (clean network - no hub capacity cuts applied)"
+    elif hub_disruption == bc.HUB_DISRUPTION_LEGACY_ALL:
+        hub_txt = "all (LEGACY: every hub with a recorded reduction is cut, regardless of event)"
+    else:
+        hub_txt = (f"{hub_disruption} (CapacityReductionPct applied only to hubs tagged "
+                   f"'{hub_disruption}')")
+    return [
+        ("Active route scenarios", ", ".join(scenarios) +
+         "  (each scenario is a separate block in the score/Summary sheets)"),
+        ("Active hub disruption", hub_txt +
+         ".  This SAME hub mode is layered onto every route scenario in this workbook."),
+    ]
+
+
+def _export_official(out_path, scaler, per_scenario, unassigned_rows, route_frames,
+                     hub_disruption=None, scenarios=None):
     """Submission-grade workbook: live formulas + assumptions + baseline + unassigned."""
     from openpyxl import Workbook
     from openpyxl.styles import Font, PatternFill, Alignment
@@ -441,8 +468,15 @@ def _export_official(out_path, scaler, per_scenario, unassigned_rows, route_fram
 
     # ---------------- Assumptions (bounds live here) ----------------
     wa = wb.create_sheet("Assumptions")
-    wa["A1"] = "ChainLab - Official MinScore: Assumptions & Normalisation Bounds"; wa["A1"].font = H1
+    wa["A1"] = "ChainLab - Combined Route Extension (delivery-grain) - NON-OFFICIAL for external"; wa["A1"].font = H1
     r = 3
+    # Active run configuration FIRST so the reader sees exactly what this file contains.
+    wa.cell(r, 1, "Active run configuration").font = H1; r += 1
+    for k, v in _run_config_rows(hub_disruption, scenarios or []):
+        wa.cell(r, 1, k).font = BD
+        c = wa.cell(r, 2, v); c.font = AR; c.alignment = Alignment(wrap_text=True, vertical="top")
+        r += 1
+    r += 1
     for k, v in ASSUMPTIONS_OFFICIAL:
         wa.cell(r, 1, k).font = BD
         c = wa.cell(r, 2, v); c.font = AR; c.alignment = Alignment(wrap_text=True, vertical="top")
@@ -573,6 +607,11 @@ def _export_official(out_path, scaler, per_scenario, unassigned_rows, route_fram
                   "PrimaryHubDown / AirCapacityReduced - the optimiser finds alternatives "
                   "(see scenario columns); baseline is reported as unavailable, not zero.").font = AR
     r += 2
+    for k, v in _run_config_rows(hub_disruption, scenarios or scs):
+        wm.cell(r, 1, k).font = BD
+        c = wm.cell(r, 2, v); c.font = AR; c.alignment = Alignment(wrap_text=True, vertical="top")
+        r += 1
+    r += 1
     wm.cell(r, 1, "Tradeoff explanation: see Assumptions sheet.").font = AR
     wm.column_dimensions["A"].width = 44
     for col in "BCD":
@@ -673,7 +712,8 @@ def run_official_delivery(sheets, horizon_weeks, scenarios, out_path):
         else:
             print("  baseline : no primary planned lanes in this scenario (reported as unavailable)")
 
-    _export_official(out_path, scaler, per_scenario, unassigned_rows, route_frames)
+    _export_official(out_path, scaler, per_scenario, unassigned_rows, route_frames,
+                     hub_disruption=sheets.get("hub_disruption"), scenarios=scenarios)
     print(f"\nWrote {out_path}")
     return summaries
 
@@ -697,6 +737,9 @@ def run_objective(sheets, horizon_weeks, scenarios, out_path):
         ch = out["result"]["chosen"].copy(); ch.insert(0, "scenario", sc); route_frames.append(ch)
 
     with pd.ExcelWriter(out_path) as xw:
+        pd.DataFrame(_run_config_rows(sheets.get("hub_disruption"), scenarios),
+                     columns=["Setting", "Value"]).to_excel(
+            xw, sheet_name="RunConfig", index=False)
         pd.DataFrame(summaries).to_excel(xw, sheet_name="Summary", index=False)
         keep = ["scenario", "ShipmentID", "MaterialFamily", "StageFrom", "StageTo",
                 "RouteOptionID", "FromHub", "ToHub", "TransportMode", "IsPrimary", "Qty",
@@ -716,14 +759,22 @@ if __name__ == "__main__":
     ap.add_argument("--objective", default="both", choices=["official", "proxy", "both"],
                     help="official = cost/kg (132 linked); proxy = cost/piece (all 240)")
     ap.add_argument("--horizon-weeks", type=int, default=PLANNING_HORIZON_WEEKS)
+    ap.add_argument("--hub-disruption", default=None,
+                    help="Hub-side capacity-cut axis (guide Scenario 1): "
+                         "omit for clean network; 'Port congestion', "
+                         "'Labor shortage', 'Weather disruption', or "
+                         "'all' (legacy pre-18-Jul behaviour).")
     args = ap.parse_args()
 
-    sheets = bc.load_sheets()
+    sheets = bc.load_sheets(hub_disruption=args.hub_disruption)
     scen = SCENARIOS if args.scenario == "all" else [args.scenario]
 
+    tag = ("" if args.hub_disruption is None
+           else "_" + args.hub_disruption.lower().replace(" ", ""))
+    print(f"Hub disruption axis: {args.hub_disruption or 'None (clean network)'}")
     if args.objective in ("official", "both"):
         run_official_delivery(sheets, args.horizon_weeks, scen,
-                              "optimizer_official_costperkg.xlsx")
+                              f"optimizer_combined_extension{tag}.xlsx")
     if args.objective in ("proxy", "both"):
         run_objective(sheets, args.horizon_weeks, scen,
-                      "optimizer_proxy_resilience.xlsx")
+                      f"optimizer_proxy_resilience{tag}.xlsx")

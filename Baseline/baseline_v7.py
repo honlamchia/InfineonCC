@@ -1,8 +1,8 @@
 """
 baseline_v7.py
 ==============
-OFFICIAL BASELINE per Infineon AI Engineer clarification (v7):
-two INDEPENDENT optimisers, no internal<->external join anywhere.
+OFFICIAL BASELINE per Infineon clarification (v7):
+two INDEPENDENT optimisers, one for internal and one for external.
 
   1. Internal baseline : all 240 internal shipments.  Cost term = BaseCostEUR
      (raw route cost - internal legs have no kg; supported by the
@@ -63,14 +63,16 @@ def model_feasible(c):
     return c[(c["BottleneckCapacityPerWeek"] > 0) & (~c["Escalation"])].copy()
 
 
-def internal_candidates(sheets, scenario):
-    return bc.apply_capability(bc.build_candidates(sheets, scenario))
+def internal_candidates(sheets, scenario, **cap_kwargs):
+    return bc.apply_capability(bc.build_candidates(sheets, scenario), **cap_kwargs)
 
 
-def external_candidates(sheets, E, scenario):
+def external_candidates(sheets, E, scenario, **cap_kwargs):
     """external_shipments -> material_families -> route_options -> hubs.
     NO join to internal_shipments (lane comes from the stage-link columns
-    already stored on the external row)."""
+    already stored on the external row).  cap_kwargs pass granular capability
+    switches (require_cold_chain / require_hazard / require_both_hubs) through
+    to apply_capability for scenario counterfactuals."""
     M, R, H = sheets["material"], sheets["route"], sheets["hub"]
     em = E.merge(
         M[["MaterialNo_Anon", "MaterialFamily", "HazardClass", "TempRequirement", "PriorityClass"]],
@@ -88,7 +90,7 @@ def external_candidates(sheets, E, scenario):
                       right_on="orig_HubID", how="left") \
                .merge(H[hub_cols].add_prefix("dest_"), left_on="ToHub",
                       right_on="dest_HubID", how="left")
-    return bc.apply_capability(cand)
+    return bc.apply_capability(cand, **cap_kwargs)
 
 
 # ---------------------------------------------------------------- scoring
@@ -157,37 +159,66 @@ def classify(unassigned, annotated, feasible, key):
     return out
 
 
-# ---------------------------------------------------------------- runners
-def run_side(side, sheets, E, out_path, horizon):
-    """side: 'internal' or 'external'."""
+# ---------------------------------------------------------------- side config
+def _side_setup(side, sheets, E):
+    """Shared per-side configuration used by run_side AND every scenario_*.py
+    script, so all models build candidates, demand, week and the cost term
+    identically.  build(sc, **cap_kwargs) is scenario-parameterised so the same
+    setup serves the canonical scaler (all 3 scenarios) and a single-scenario run."""
     if side == "internal":
         universe = sheets["internal"]["ShipmentID"].tolist()
         qty_map = sheets["internal"].set_index("ShipmentID")["Qty"].to_dict()
         wk_map = dict(zip(sheets["internal"]["ShipmentID"],
                           opt.iso_week(sheets["internal"]["ShipDate"])))
-        key, cost_label = "ShipmentID", "BaseCostEUR (raw route cost - no kg on internal legs)"
-        build = lambda sc: internal_candidates(sheets, sc)
+        key = "ShipmentID"
+        cost_label = "BaseCostEUR (raw route cost - no kg on internal legs)"
+        build = lambda sc, **kw: internal_candidates(sheets, sc, **kw)
         add_cost = lambda c: c.assign(CostForScore=c["BaseCostEUR"])
     else:
         universe = E["DeliveryNo"].tolist()
         qty_map = E.set_index("DeliveryNo")["Pieces"].to_dict()
         wk_map = dict(zip(E["DeliveryNo"], opt.iso_week(E["PUP_Date"])))
-        key, cost_label = "DeliveryNo", "CostPerKG = BaseCostEUR / individual ChargeableWeight_KG"
+        key = "DeliveryNo"
+        cost_label = "CostPerKG = BaseCostEUR / individual ChargeableWeight_KG"
         wmap = E.set_index("DeliveryNo")["ChargeableWeight_KG"].to_dict()
-        build = lambda sc: external_candidates(sheets, E, sc)
+        build = lambda sc, **kw: external_candidates(sheets, E, sc, **kw)
         add_cost = lambda c: c.assign(CostForScore=c["BaseCostEUR"] / c[key].map(wmap))
+    return {"universe": universe, "qty_map": qty_map, "wk_map": wk_map, "key": key,
+            "cost_label": cost_label, "build": build, "add_cost": add_cost}
+
+
+def canonical_scaler(side, sheets, E, horizon):
+    """THE fixed 40/40/20 min-max scaler for a side.  Fitted on feasible
+    candidates with FULL capability rules across Normal + PrimaryHubDown +
+    AirCapacityReduced - exactly as the official baseline.  Every scenario
+    script MUST use this so all scores share one normalisation ruler and
+    differences reflect scenario effects, not different scalers.  Internal and
+    external keep separate scalers (different cost terms)."""
+    cfg = _side_setup(side, sheets, E)
+    frames = []
+    for sc in SCENARIOS:
+        ann = cfg["add_cost"](capacity_fields(cfg["build"](sc), cfg["qty_map"],
+                                              cfg["key"], horizon))
+        frames.append(model_feasible(ann))
+    return fit_scaler(frames)
+
+
+# ---------------------------------------------------------------- runners
+def run_side(side, sheets, E, out_path, horizon):
+    """side: 'internal' or 'external'."""
+    cfg = _side_setup(side, sheets, E)
+    universe, qty_map, wk_map, key, cost_label, build, add_cost = (
+        cfg["universe"], cfg["qty_map"], cfg["wk_map"], cfg["key"],
+        cfg["cost_label"], cfg["build"], cfg["add_cost"])
 
     hub_remaining = sheets["hub"].set_index("HubID")["remaining_capacity_units"].to_dict()
 
     per_scen = {}
-    frames = []
     for sc in SCENARIOS:
         ann = add_cost(capacity_fields(build(sc), qty_map, key, horizon))
         ann["week"] = ann[key].map(wk_map)
-        feas = model_feasible(ann)
-        per_scen[sc] = (ann, feas)
-        frames.append(feas)
-    scaler = fit_scaler(frames)
+        per_scen[sc] = (ann, model_feasible(ann))
+    scaler = canonical_scaler(side, sheets, E, horizon)
 
     summaries, sel_frames, un_rows = [], [], []
     for sc in SCENARIOS:
@@ -236,9 +267,25 @@ def run_side(side, sheets, E, out_path, horizon):
         {"metric": "CostForScore",     "min": scaler["cost"][0], "max": scaler["cost"][1]},
         {"metric": "RiskScore",        "min": scaler["risk"][0], "max": scaler["risk"][1]}])
 
+    hub_dis = sheets.get("hub_disruption")
+    _ext_ext = ("\n*** EXTENSION, NOT THE OFFICIAL EXTERNAL BASELINE ***  Per Infineon instructor "
+                "clarification, the official external MinScore is a DIRECT 40/40/20 calculation on the "
+                "supplied External Shipments.{BestLeadTimeDays, LowestCostPerKG_EUR, LowestRiskScore} "
+                "columns - see optimizer_external_official_scores.xlsx. This route-selection model "
+                "(route_options cost/kg) is retained only as an operational route extension; its score "
+                "is a ScenarioRouteScore, not the official ExternalMinScore." if side == "external" else "")
     assumptions = pd.DataFrame([
         ("Baseline definition", f"Independent {side} optimiser per Infineon AI Engineer clarification. "
-         "No join between internal_shipments and external_shipments anywhere in this model."),
+         "No join between internal_shipments and external_shipments anywhere in this model." + _ext_ext),
+        ("Hub disruption (capacity cuts)",
+         ("None applied - clean network; Hub_Constraints.CapacityReductionPct ignored (true baseline)."
+          if hub_dis is None else
+          "LEGACY MODE: CapacityReductionPct applied to EVERY hub that carries a recorded "
+          "reduction, regardless of its DisruptionScenario label (reproduces pre-18-Jul runs). "
+          "Independent of the route-side scenario axis."
+          if hub_dis == "all" else
+          f"CapacityReductionPct applied ONLY to hubs where Hub_Constraints.DisruptionScenario "
+          f"== '{hub_dis}'. Independent of the route-side scenario axis.")),
         ("Objective", "MinScore = 0.4*norm(BaseLeadTimeDays) + 0.4*norm(cost term) + 0.2*norm(RiskScore); "
          "lower is better. Min-max normalisation is a stated modelling assumption."),
         ("Cost term", cost_label),
@@ -292,9 +339,14 @@ def cost_basis_check(sheets, E):
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--horizon-weeks", type=int, default=HORIZON)
+    ap.add_argument("--hub-disruption", default=None,
+                    help="Hub-side capacity-cut axis (guide Scenario 1): "
+                         "omit for clean network; 'Port congestion', "
+                         "'Labor shortage', 'Weather disruption', or "
+                         "'all' (legacy pre-18-Jul behaviour).")
     args = ap.parse_args()
 
-    sheets = bc.load_sheets()
+    sheets = bc.load_sheets(hub_disruption=args.hub_disruption)
     E = pd.read_excel(bc.WORKBOOK, sheet_name="External Shipments")
 
     im, em = cost_basis_check(sheets, E)
@@ -303,7 +355,10 @@ if __name__ == "__main__":
     print("HackathonObjectiveScore ships EMPTY in the student dataset - no organiser score to "
           "reconstruct; raw BaseCostEUR chosen for internal (see Assumptions).")
 
+    tag = ("" if args.hub_disruption is None
+           else "_" + args.hub_disruption.lower().replace(" ", ""))
+    print(f"\nHub disruption axis: {args.hub_disruption or 'None (clean network)'}")
     print("\nINTERNAL BASELINE (240 shipments)")
-    run_side("internal", sheets, E, "optimizer_internal_baseline.xlsx", args.horizon_weeks)
-    print("\nEXTERNAL BASELINE (225 deliveries)")
-    run_side("external", sheets, E, "optimizer_external_baseline.xlsx", args.horizon_weeks)
+    run_side("internal", sheets, E, f"optimizer_internal_baseline{tag}.xlsx", args.horizon_weeks)
+    print("\nEXTERNAL ROUTE EXTENSION (225 deliveries) - NOT the official external baseline")
+    run_side("external", sheets, E, f"optimizer_external_route_extension{tag}.xlsx", args.horizon_weeks)
